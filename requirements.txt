@@ -1,0 +1,2 @@
+# Desktop validation environment; Pythonista uses its bundled Pillow.
+Pillow==12.2.0
