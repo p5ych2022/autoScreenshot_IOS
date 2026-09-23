@@ -115,9 +115,11 @@ def detect_crop(image):
     """Return a candidate rectangle, not a calibrated confidence probability."""
     width, height = image.size
     original = (0, 0, width, height)
-    preview = image.copy()
-    preview.thumbnail((384, 768), RESAMPLE)
-    preview = preview.convert("RGB")
+    scale = min(1.0, 384 / width, 768 / height)
+    analysis_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    preview = image.resize(analysis_size, RESAMPLE)
+    if preview.mode != "RGB":
+        preview = preview.convert("RGB")
     box = [0, 0, preview.width, preview.height]
     detected = []
     reasons = []
@@ -152,20 +154,151 @@ def detect_crop(image):
 
 def open_image(path):
     with Image.open(path) as source:
-        return ImageOps.exif_transpose(source).convert("RGB")
+        source.load()
+        if source.getexif().get(274, 1) in range(2, 9):
+            image = ImageOps.exif_transpose(source)
+            source.close()
+        else:
+            image = source
+        if image.mode != "RGB":
+            converted = image.convert("RGB")
+            image.close()
+            return converted
+        return image
+
+
+def _write_stage(stage, details="", reset=False):
+    """Persist progress before native calls; a killed extension cannot raise Python errors."""
+    message = "{} {} {}\n".format(time.strftime("%H:%M:%S"), stage, details)
+    try:
+        log_path = Path(__file__).with_name("pythonista_diagnostic.log")
+        with log_path.open("w" if reset else "a", encoding="utf-8") as log:
+            log.write(message)
+            log.flush()
+    except OSError:
+        print(message, end="", flush=True)
 
 
 def run_pythonista():
-    """Input Files supplies paths; no direct Photos writes or deletion here."""
+    """Input Files supplies paths; optional Arguments='diagnose' returns text only."""
     import shortcuts
-    paths = [Path(argument) for argument in sys.argv[1:] if Path(argument).is_file()]
-    if len(paths) != 1:
-        raise ValueError("Pass exactly one screenshot using Input Files.")
-    image = open_image(paths[0])
-    result = detect_crop(image)
-    if result.status != "candidate":
-        raise RuntimeError("Cannot safely locate a single image: " + result.reason)
-    shortcuts.set_output_image(image.crop(result.box))
+    _write_stage("START", "build=2026-09-23.3 python=" + sys.version.split()[0], reset=True)
+    image = None
+    try:
+        paths = [Path(argument) for argument in sys.argv[1:] if Path(argument).is_file()]
+        diagnose = "diagnose" in sys.argv[1:]
+        _write_stage("INPUT", "files={} diagnose={}".format(len(paths), diagnose))
+        if len(paths) != 1:
+            raise ValueError("Pass exactly one screenshot using Input Files.")
+        _write_stage("HEADER_BEGIN")
+        with Image.open(paths[0]) as header:
+            _write_stage("HEADER_DONE", "format={} size={} mode={}".format(
+                header.format, header.size, header.mode))
+        _write_stage("DECODE_BEGIN")
+        image = open_image(paths[0])
+        _write_stage("DECODE_DONE", "size={} mode={}".format(image.size, image.mode))
+        _write_stage("DETECT_BEGIN")
+        result = detect_crop(image)
+        _write_stage("DETECT_DONE", "status={} box={} reason={}".format(
+            result.status, result.box, result.reason))
+        if diagnose:
+            print("Detection finished. Image: {}. Status: {}. Box: {}. Reason: {}. "
+                  "No image was saved or returned.".format(image.size, result.status, result.box, result.reason))
+            _write_stage("TEXT_OUTPUT_DONE")
+            return
+        if result.status != "candidate":
+            raise RuntimeError("Cannot safely locate a single image: " + result.reason)
+        _write_stage("CROP_BEGIN")
+        cropped = image.crop(result.box)
+        image.close()
+        image = None
+        _write_stage("CROP_DONE", "size={}".format(cropped.size))
+        _write_stage("OUTPUT_BEGIN")
+        shortcuts.set_output_image(cropped)
+        _write_stage("OUTPUT_DONE")
+    except Exception as error:
+        _write_stage("ERROR", type(error).__name__)
+        raise
+    finally:
+        if image is not None:
+            image.close()
+
+
+def _save_new_png(image, source_path):
+    index = 1
+    while True:
+        suffix = ".cropped.png" if index == 1 else ".cropped-{}.png".format(index)
+        output = source_path.with_name(source_path.stem + suffix)
+        try:
+            stream = output.open("xb")
+        except FileExistsError:
+            index += 1
+            continue
+        try:
+            with stream:
+                image.save(stream, format="PNG")
+        except Exception:
+            output.unlink()
+            raise
+        return output
+
+
+def run_pythonista_local(filename=None):
+    """Preview a local file in the main app; no Shortcuts output or Photos writes."""
+    import console
+    if filename is None:
+        if len(sys.argv) > 2:
+            raise ValueError("Direct preview accepts at most one image file path.")
+        filename = sys.argv[1] if len(sys.argv) == 2 else "IMG_2844.PNG"
+    source = Path(filename)
+    if not source.is_absolute():
+        source = Path(__file__).resolve().parent / source
+    _write_stage("LOCAL_START", "build=2026-09-23.3", reset=True)
+    image = None
+    cropped = None
+    try:
+        if not source.is_file():
+            raise FileNotFoundError("找不到图片，请将图片放在脚本同目录：" + str(source))
+        print("本地预览模式 2026-09-23.3；不向快捷指令返回图片。", flush=True)
+        print("输入文件：" + str(source), flush=True)
+        _write_stage("DECODE_BEGIN")
+        image = open_image(source)
+        print("输入尺寸：{} × {}".format(*image.size), flush=True)
+        _write_stage("DECODE_DONE", "size={} mode={}".format(image.size, image.mode))
+        _write_stage("DETECT_BEGIN")
+        result = detect_crop(image)
+        print("检测结果：{}；裁剪框：{}；原因：{}".format(
+            result.status, result.box, result.reason), flush=True)
+        _write_stage("DETECT_DONE", "status={} box={}".format(result.status, result.box))
+        if result.status != "candidate":
+            print("未找到可靠裁剪区域，不生成新文件。", flush=True)
+            _write_stage("LOCAL_REVIEW")
+            return None
+        _write_stage("CROP_BEGIN")
+        cropped = image.crop(result.box)
+        image.close()
+        image = None
+        _write_stage("CROP_DONE", "size={}".format(cropped.size))
+        _write_stage("SAVE_BEGIN")
+        output = _save_new_png(cropped, source)
+        print("输出尺寸：{} × {}".format(*cropped.size), flush=True)
+        cropped.close()
+        cropped = None
+        _write_stage("SAVE_DONE")
+        print("已保存新文件：" + str(output), flush=True)
+        print("原图未修改；未自动存入照片相册。", flush=True)
+        _write_stage("PREVIEW_BEGIN")
+        console.quicklook(str(output))
+        _write_stage("PREVIEW_DONE")
+        return output
+    except Exception as error:
+        _write_stage("ERROR", type(error).__name__)
+        raise
+    finally:
+        if image is not None:
+            image.close()
+        if cropped is not None:
+            cropped.close()
 
 
 def _write_gallery(output, records):
@@ -248,4 +381,4 @@ if __name__ == "__main__":
         if shortcuts.is_running_shortcut():
             run_pythonista()
         else:
-            raise RuntimeError("Run via Shortcuts with 'Run in Pythonista' switched off.")
+            run_pythonista_local()
