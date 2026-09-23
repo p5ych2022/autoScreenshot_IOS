@@ -1,0 +1,7 @@
+.DS_Store
+__pycache__/
+*.pyc
+pythonista_diagnostic.log
+results/
+*_cropped*.png
+*.cropped*.png
