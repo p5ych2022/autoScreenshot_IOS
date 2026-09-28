@@ -1,19 +1,20 @@
-"""Offline screenshot crop prototype. Input files and Photos are never modified."""
+"""Crop an iOS screenshot using fixed files in Pythonista's iCloud folder."""
 
-import argparse
 from collections import Counter
-from dataclasses import asdict, dataclass
-import hashlib
-import html
-import json
+from dataclasses import dataclass
 from pathlib import Path
 from statistics import median
 import sys
 import time
 
-from PIL import Image, ImageDraw, ImageOps
+from PIL import Image, ImageOps
 
 RESAMPLE = getattr(Image, "Resampling", Image).BILINEAR
+BUILD = "2026-09-28.2"
+BRIDGE_MODE = "shortcut-file"
+INPUT_NAME = "shortcut-input.png"
+OUTPUT_NAME = "shortcut-output.png"
+TEMP_OUTPUT_NAME = ".shortcut-output.tmp"
 
 
 @dataclass(frozen=True)
@@ -40,8 +41,11 @@ def _background(pixels, width, height, vertical, end):
             counts[tuple(channel // 16 for channel in color)] += 1
     bucket, _ = counts.most_common(1)[0]
     color = tuple(channel * 16 + 7 for channel in bucket)
-    coverage = sum(count for key, count in counts.items()
-                   if _distance(tuple(channel * 16 + 7 for channel in key), color) <= 24)
+    coverage = sum(
+        count
+        for key, count in counts.items()
+        if _distance(tuple(channel * 16 + 7 for channel in key), color) <= 24
+    )
     coverage /= depth * breadth
     neutral = max(color) <= 55 or min(color) >= 215
     if not neutral or coverage < 0.5:
@@ -52,12 +56,15 @@ def _background(pixels, width, height, vertical, end):
 def _profile(image, vertical):
     width, height = image.size
     pixels = image.load()
-    backgrounds = [_background(pixels, width, height, vertical, end)
-                   for end in (False, True)]
+    backgrounds = [
+        _background(pixels, width, height, vertical, end)
+        for end in (False, True)
+    ]
     if any(color is None for color in backgrounds):
         return None
     if _distance(*backgrounds) > 32:
         return None
+
     length = height if vertical else width
     breadth = width if vertical else height
     values = []
@@ -85,20 +92,32 @@ def _runs(flags):
 
 def _content_band(values):
     length = len(values)
-    smooth = [median(values[max(0, i - 1):min(length, i + 2)])
-              for i in range(length)]
+    smooth = [
+        median(values[max(0, index - 1):min(length, index + 2)])
+        for index in range(length)
+    ]
     flags = [value >= 0.28 for value in smooth]
     gap_limit = max(1, round(length * 0.008))
     for start, end in _runs([not flag for flag in flags]):
         if start > 0 and end < length and end - start <= gap_limit:
             flags[start:end] = [True] * (end - start)
-    bands = [(start, end) for start, end in _runs(flags)
-             if end - start >= length * 0.16]
+
+    bands = [
+        (start, end)
+        for start, end in _runs(flags)
+        if end - start >= length * 0.16
+    ]
     if not bands:
         return None, "no_dominant_content_band"
+
     bands.sort(key=lambda band: band[1] - band[0], reverse=True)
-    if len(bands) > 1 and bands[1][1] - bands[1][0] >= (bands[0][1] - bands[0][0]) * 0.45:
+    if (
+        len(bands) > 1
+        and bands[1][1] - bands[1][0]
+        >= (bands[0][1] - bands[0][0]) * 0.45
+    ):
         return None, "multiple_content_bands"
+
     start, end = bands[0]
     while start > 0 and values[start - 1] > 0.10:
         start -= 1
@@ -112,44 +131,62 @@ def _content_band(values):
 
 
 def detect_crop(image):
-    """Return a candidate rectangle, not a calibrated confidence probability."""
+    """Return a conservative crop candidate for uniform black or white margins."""
     width, height = image.size
     original = (0, 0, width, height)
     scale = min(1.0, 384 / width, 768 / height)
-    analysis_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    analysis_size = (
+        max(1, round(width * scale)),
+        max(1, round(height * scale)),
+    )
     preview = image.resize(analysis_size, RESAMPLE)
     if preview.mode != "RGB":
-        preview = preview.convert("RGB")
-    box = [0, 0, preview.width, preview.height]
-    detected = []
-    reasons = []
-    for vertical in (True, False):
-        # Horizontal analysis uses only the candidate's content, not toolbar bars.
-        area = preview if vertical else preview.crop(tuple(box))
-        values = _profile(area, vertical)
-        if values is None:
-            reasons.append("no_uniform_background")
-            continue
-        band, reason = _content_band(values)
-        reasons.append(reason)
-        if band is not None:
-            start, end = band
-            if vertical:
-                box[1], box[3] = start, end
-            else:
-                box[0], box[2] = start, end
-            detected.append("vertical" if vertical else "horizontal")
-    if not detected:
-        return Detection(original, "review", ";".join(reasons), preview.size)
-    # Keep one analysis pixel of safety padding instead of eating image edges.
-    left = max(0, int((box[0] - 1) * width / preview.width))
-    top = max(0, int((box[1] - 1) * height / preview.height))
-    right = min(width, int((box[2] + 1) * width / preview.width + 0.999))
-    bottom = min(height, int((box[3] + 1) * height / preview.height + 0.999))
-    if (right - left) * (bottom - top) < width * height * 0.2:
-        return Detection(original, "review", "candidate_too_small", preview.size)
-    return Detection((left, top, right, bottom), "candidate",
-                     "detected_" + "_and_".join(detected), preview.size)
+        converted = preview.convert("RGB")
+        preview.close()
+        preview = converted
+
+    try:
+        box = [0, 0, preview.width, preview.height]
+        detected = []
+        reasons = []
+        for vertical in (True, False):
+            area = preview if vertical else preview.crop(tuple(box))
+            try:
+                values = _profile(area, vertical)
+            finally:
+                if area is not preview:
+                    area.close()
+            if values is None:
+                reasons.append("no_uniform_background")
+                continue
+
+            band, reason = _content_band(values)
+            reasons.append(reason)
+            if band is not None:
+                start, end = band
+                if vertical:
+                    box[1], box[3] = start, end
+                else:
+                    box[0], box[2] = start, end
+                detected.append("vertical" if vertical else "horizontal")
+
+        if not detected:
+            return Detection(original, "review", ";".join(reasons), preview.size)
+
+        left = max(0, int((box[0] - 1) * width / preview.width))
+        top = max(0, int((box[1] - 1) * height / preview.height))
+        right = min(width, int((box[2] + 1) * width / preview.width + 0.999))
+        bottom = min(height, int((box[3] + 1) * height / preview.height + 0.999))
+        if (right - left) * (bottom - top) < width * height * 0.2:
+            return Detection(original, "review", "candidate_too_small", preview.size)
+        return Detection(
+            (left, top, right, bottom),
+            "candidate",
+            "detected_" + "_and_".join(detected),
+            preview.size,
+        )
+    finally:
+        preview.close()
 
 
 def open_image(path):
@@ -168,10 +205,9 @@ def open_image(path):
 
 
 def _write_stage(stage, details="", reset=False):
-    """Persist progress before native calls; a killed extension cannot raise Python errors."""
     message = "{} {} {}\n".format(time.strftime("%H:%M:%S"), stage, details)
+    log_path = Path(__file__).with_name("pythonista_diagnostic.log")
     try:
-        log_path = Path(__file__).with_name("pythonista_diagnostic.log")
         with log_path.open("w" if reset else "a", encoding="utf-8") as log:
             log.write(message)
             log.flush()
@@ -179,118 +215,45 @@ def _write_stage(stage, details="", reset=False):
         print(message, end="", flush=True)
 
 
-def run_pythonista():
-    """Input Files supplies paths; optional Arguments='diagnose' returns text only."""
+def run_direct_shortcut():
+    """Receive one Input Files image and return the crop to Shortcuts."""
     import shortcuts
-    _write_stage("START", "build=2026-09-23.3 python=" + sys.version.split()[0], reset=True)
+
     image = None
+    cropped = None
+    _write_stage("DIRECT_START", "build={}".format(BUILD), reset=True)
     try:
         paths = [Path(argument) for argument in sys.argv[1:] if Path(argument).is_file()]
-        diagnose = "diagnose" in sys.argv[1:]
-        _write_stage("INPUT", "files={} diagnose={}".format(len(paths), diagnose))
+        _write_stage("INPUT", "files={}".format(len(paths)))
         if len(paths) != 1:
             raise ValueError("Pass exactly one screenshot using Input Files.")
-        _write_stage("HEADER_BEGIN")
-        with Image.open(paths[0]) as header:
-            _write_stage("HEADER_DONE", "format={} size={} mode={}".format(
-                header.format, header.size, header.mode))
-        _write_stage("DECODE_BEGIN")
+
+        _write_stage("DECODE_BEGIN", "source=" + paths[0].name)
         image = open_image(paths[0])
         _write_stage("DECODE_DONE", "size={} mode={}".format(image.size, image.mode))
+
         _write_stage("DETECT_BEGIN")
         result = detect_crop(image)
-        _write_stage("DETECT_DONE", "status={} box={} reason={}".format(
-            result.status, result.box, result.reason))
-        if diagnose:
-            print("Detection finished. Image: {}. Status: {}. Box: {}. Reason: {}. "
-                  "No image was saved or returned.".format(image.size, result.status, result.box, result.reason))
-            _write_stage("TEXT_OUTPUT_DONE")
-            return
+        _write_stage(
+            "DETECT_DONE",
+            "status={} box={} reason={}".format(
+                result.status,
+                result.box,
+                result.reason,
+            ),
+        )
         if result.status != "candidate":
             raise RuntimeError("Cannot safely locate a single image: " + result.reason)
+
         _write_stage("CROP_BEGIN")
         cropped = image.crop(result.box)
         image.close()
         image = None
         _write_stage("CROP_DONE", "size={}".format(cropped.size))
+
         _write_stage("OUTPUT_BEGIN")
         shortcuts.set_output_image(cropped)
         _write_stage("OUTPUT_DONE")
-    except Exception as error:
-        _write_stage("ERROR", type(error).__name__)
-        raise
-    finally:
-        if image is not None:
-            image.close()
-
-
-def _save_new_png(image, source_path):
-    index = 1
-    while True:
-        suffix = ".cropped.png" if index == 1 else ".cropped-{}.png".format(index)
-        output = source_path.with_name(source_path.stem + suffix)
-        try:
-            stream = output.open("xb")
-        except FileExistsError:
-            index += 1
-            continue
-        try:
-            with stream:
-                image.save(stream, format="PNG")
-        except Exception:
-            output.unlink()
-            raise
-        return output
-
-
-def run_pythonista_local(filename=None):
-    """Preview a local file in the main app; no Shortcuts output or Photos writes."""
-    import console
-    if filename is None:
-        if len(sys.argv) > 2:
-            raise ValueError("Direct preview accepts at most one image file path.")
-        filename = sys.argv[1] if len(sys.argv) == 2 else "IMG_2844.PNG"
-    source = Path(filename)
-    if not source.is_absolute():
-        source = Path(__file__).resolve().parent / source
-    _write_stage("LOCAL_START", "build=2026-09-23.3", reset=True)
-    image = None
-    cropped = None
-    try:
-        if not source.is_file():
-            raise FileNotFoundError("找不到图片，请将图片放在脚本同目录：" + str(source))
-        print("本地预览模式 2026-09-23.3；不向快捷指令返回图片。", flush=True)
-        print("输入文件：" + str(source), flush=True)
-        _write_stage("DECODE_BEGIN")
-        image = open_image(source)
-        print("输入尺寸：{} × {}".format(*image.size), flush=True)
-        _write_stage("DECODE_DONE", "size={} mode={}".format(image.size, image.mode))
-        _write_stage("DETECT_BEGIN")
-        result = detect_crop(image)
-        print("检测结果：{}；裁剪框：{}；原因：{}".format(
-            result.status, result.box, result.reason), flush=True)
-        _write_stage("DETECT_DONE", "status={} box={}".format(result.status, result.box))
-        if result.status != "candidate":
-            print("未找到可靠裁剪区域，不生成新文件。", flush=True)
-            _write_stage("LOCAL_REVIEW")
-            return None
-        _write_stage("CROP_BEGIN")
-        cropped = image.crop(result.box)
-        image.close()
-        image = None
-        _write_stage("CROP_DONE", "size={}".format(cropped.size))
-        _write_stage("SAVE_BEGIN")
-        output = _save_new_png(cropped, source)
-        print("输出尺寸：{} × {}".format(*cropped.size), flush=True)
-        cropped.close()
-        cropped = None
-        _write_stage("SAVE_DONE")
-        print("已保存新文件：" + str(output), flush=True)
-        print("原图未修改；未自动存入照片相册。", flush=True)
-        _write_stage("PREVIEW_BEGIN")
-        console.quicklook(str(output))
-        _write_stage("PREVIEW_DONE")
-        return output
     except Exception as error:
         _write_stage("ERROR", type(error).__name__)
         raise
@@ -301,84 +264,92 @@ def run_pythonista_local(filename=None):
             cropped.close()
 
 
-def _write_gallery(output, records):
-    entries = []
-    contact = Image.new("RGB", (len(records) * 460, 570), "#eff2f6")
-    draw = ImageDraw.Draw(contact)
-    for index, record in enumerate(records):
-        prefix = record["prefix"]
-        entries.append(
-            '<article><h2>' + html.escape(record["source"]) + '</h2><p>'
-            + html.escape(str(record["detection"]["box"])) + ' · '
-            + html.escape(record["detection"]["status"]) + '</p><div>'
-            + '<figure><img src="' + prefix + '.marked.png"><figcaption>检测边界</figcaption></figure>'
-            + '<figure><img src="' + prefix + '.cropped.png"><figcaption>裁剪候选</figcaption></figure>'
-            + '</div></article>')
-        for column, suffix in enumerate(("marked", "cropped")):
-            with Image.open(output / (prefix + "." + suffix + ".png")) as image:
-                thumb = image.convert("RGB")
-                thumb.thumbnail((215, 490), RESAMPLE)
-                x = index * 460 + column * 225 + 10
-                contact.paste(thumb, (x, 45))
-                draw.text((x, 12), str(index + 1) + " " + suffix, fill="#203047")
-        draw.text((index * 460 + 10, 540), str(record["output_size"]), fill="#203047")
-    contact.save(output / "comparison.jpg", quality=92)
-    document = '''<!doctype html><html lang="zh-CN"><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>截图裁剪实验</title><style>
-body{font-family:system-ui;margin:32px;background:#eff2f6;color:#203047}
-main{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:24px}
-article{background:white;padding:20px;border-radius:16px}h2{font-size:16px;word-break:break-all}
-article div{display:flex;gap:12px}figure{margin:0;width:50%}img{width:100%;height:auto}
-figcaption{padding:8px 0;color:#567}p{line-height:1.6}</style>
-<h1>截图裁剪实验</h1><p>绿色为检测框；原始样本未改动。结果仅为候选，需要人工核验。
-图内水印、字幕、遮挡不会被修复。这里没有上传任何截图。</p><main>'''
-    (output / "index.html").write_text(document + "".join(entries) + "</main></html>", encoding="utf-8")
+def _save_png_atomic(image, output, temporary):
+    temporary.unlink(missing_ok=True)
+    try:
+        with temporary.open("xb") as stream:
+            image.save(stream, format="PNG")
+        temporary.replace(output)
+    except Exception:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def run_file_bridge(base_directory=None):
+    """Read the fixed iCloud input and atomically replace the fixed output."""
+    base = Path(base_directory) if base_directory else Path(__file__).resolve().parent
+    source = base / INPUT_NAME
+    output = base / OUTPUT_NAME
+    temporary = base / TEMP_OUTPUT_NAME
+    image = None
+    cropped = None
+
+    _write_stage("BRIDGE_START", "build={}".format(BUILD), reset=True)
+    output.unlink(missing_ok=True)
+    temporary.unlink(missing_ok=True)
+    try:
+        if not source.is_file():
+            raise FileNotFoundError("Missing bridge input: " + str(source))
+
+        _write_stage("DECODE_BEGIN", "source=" + source.name)
+        image = open_image(source)
+        _write_stage("DECODE_DONE", "size={} mode={}".format(image.size, image.mode))
+
+        _write_stage("DETECT_BEGIN")
+        result = detect_crop(image)
+        _write_stage(
+            "DETECT_DONE",
+            "status={} box={} reason={}".format(
+                result.status,
+                result.box,
+                result.reason,
+            ),
+        )
+        if result.status != "candidate":
+            raise RuntimeError("Cannot safely locate a single image: " + result.reason)
+
+        _write_stage("CROP_BEGIN")
+        cropped = image.crop(result.box)
+        image.close()
+        image = None
+        _write_stage("CROP_DONE", "size={}".format(cropped.size))
+
+        _write_stage("SAVE_BEGIN", "output=" + output.name)
+        _save_png_atomic(cropped, output, temporary)
+        _write_stage("SAVE_DONE", "size={}".format(output.stat().st_size))
+        return output
+    except Exception as error:
+        output.unlink(missing_ok=True)
+        temporary.unlink(missing_ok=True)
+        _write_stage("ERROR", type(error).__name__)
+        raise
+    finally:
+        if image is not None:
+            image.close()
+        if cropped is not None:
+            cropped.close()
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("input", type=Path, help="Image file or sample directory")
-    parser.add_argument("--output", type=Path, required=True, help="New, empty output directory")
-    args = parser.parse_args()
-    files = [args.input] if args.input.is_file() else sorted(
-        path for path in args.input.iterdir()
-        if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".webp"})
-    if not files:
-        parser.error("No input images found.")
-    if args.output.exists() and any(args.output.iterdir()):
-        parser.error("Output directory must be empty; existing results are not overwritten.")
-    args.output.mkdir(parents=True, exist_ok=True)
-    records = []
-    for index, path in enumerate(files, start=1):
-        before = hashlib.sha256(path.read_bytes()).hexdigest()
-        start = time.perf_counter()
-        image = open_image(path)
-        result = detect_crop(image)
-        cropped = image.crop(result.box)
-        elapsed = time.perf_counter() - start
-        prefix = "{:02d}_{}".format(index, path.stem)
-        cropped.save(args.output / (prefix + ".cropped.png"))
-        marked = image.copy()
-        ImageDraw.Draw(marked).rectangle(result.box, outline="#26d07c", width=max(2, image.width // 150))
-        marked.save(args.output / (prefix + ".marked.png"))
-        unchanged = before == hashlib.sha256(path.read_bytes()).hexdigest()
-        record = {"source": path.name, "prefix": prefix, "source_size": image.size,
-                  "output_size": cropped.size, "detection": asdict(result),
-                  "processing_seconds": round(elapsed, 4), "source_unchanged": unchanged}
-        records.append(record)
-        print(json.dumps(record, ensure_ascii=False))
-    (args.output / "results.json").write_text(json.dumps(records, ensure_ascii=False, indent=2), encoding="utf-8")
-    _write_gallery(args.output, records)
+    if BRIDGE_MODE in sys.argv[1:]:
+        run_file_bridge()
+        return
+
+    try:
+        import shortcuts
+    except ImportError as error:
+        raise RuntimeError(
+            "Use Input Files in Shortcuts, or run in Pythonista with "
+            "Arguments set to 'shortcut-file'."
+        ) from error
+
+    if not shortcuts.is_running_shortcut():
+        raise RuntimeError(
+            "Direct mode requires Run in Pythonista to be off. "
+            "File mode requires Arguments='shortcut-file'."
+        )
+    run_direct_shortcut()
 
 
 if __name__ == "__main__":
-    try:
-        import shortcuts
-    except ImportError:
-        main()
-    else:
-        if shortcuts.is_running_shortcut():
-            run_pythonista()
-        else:
-            run_pythonista_local()
+    main()
